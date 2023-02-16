@@ -1,0 +1,847 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS CloudFormation template to support FIS blog post 
+  Injecting API failures with AWS Fault Injection Simulator and IAM policies
+
+  This template creates an S3 bucket, an EventBridge rule, multiple Lambda functions, 
+  multiple IAM roles, as well as FIS templates and SSM documents. 
+
+  The IAM permission policies in this template use wildcards for easy scalability
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Parameters:
+  BucketNamePrefix:
+    Description: Prefix for the S3 bucket created. This will have the account ID appended to make it unique
+    Type: String
+    Default: fis-api-failure
+  FaultInjectionExperimentDuration:
+    Type: String
+    Description: 'Enter the Duration of the Access Denied Injection in ISO 8601 Format, e.g. PT2M = 2 Minutes'
+    Default: PT2M
+  PolicyNamePrefix:
+    Type: String
+    Description: 'A prefix for policy names we can attach/detach. Note that this only modifies permissions. Policy names are hardcoded for added security.'
+    Default: FISAPI-DenyS3
+  RoleNamePrefixEventBridge:
+    Type: String
+    Description: 'A prefix for role names pertaining to EventBridge. Note that this only modifies permissions. Policy names are hardcoded for added security.'
+    Default: FISAPI-TARGET-EventBridge
+  RoleNamePrefixS3:
+    Type: String
+    Description: 'A prefix for role names pertaining to S3. Note that this only modifies permissions. Policy names are hardcoded for added security.'
+    Default: FISAPI-TARGET-S3
+  SsmAutomationDocumentPrefix:
+    Type: String
+    Description: 'A prefix for SSM document names that FIS can use. Note that this only modifies permissions. Policy names are hardcoded for added security.'
+    Default: FISAPI-
+
+Resources:
+
+  ############################################################################
+  # S3 bucket private to your account. 
+  # 
+  # This bucket will be used to create small files that get automatically 
+  # deleted using the attached S3 notification / Lambda function. Some files
+  # will remain in the bucket during periods where fault injections prevents
+  # deletion. Any objects in this bucket will be deleted after 1 day by the 
+  # lifecycle policy
+  ############################################################################
+  S3Bucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${BucketNamePrefix}-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteImpactedFiles
+            Status: Enabled
+            ExpirationInDays: 1
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt S3TriggerHandler.Arn
+            Filter:
+              S3Key:
+                Rules:
+                - Name: suffix
+                  Value: .txt
+
+
+  ############################################################################
+  # Eventbridge / Lambda 
+  #
+  # Sets up a Lambda function to run once a minute and create a file in the 
+  # S3 bucket
+  ############################################################################
+  EventBridgeTimerHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: FISAPI-TARGET-EventBridgeTimerHandlerRole
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: AllowS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - 's3:PutObject'
+                Resource: 
+                  - !Sub 'arn:${AWS::Partition}:s3:::${BucketNamePrefix}-${AWS::AccountId}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${BucketNamePrefix}-${AWS::AccountId}/*'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+
+  EventBridgeTimerHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      ReservedConcurrentExecutions: 5
+      Runtime: python3.9
+      Role: !GetAtt EventBridgeTimerHandlerRole.Arn
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          BucketName: !Sub '${BucketNamePrefix}-${AWS::AccountId}'
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import datetime
+          import boto3
+
+          s3 = boto3.resource('s3')
+
+          def lambda_handler(event, context):
+              try:
+                  print(event)
+                  bucket_name = os.environ.get("BucketName","undefined")
+                  if bucket_name != "undefined":
+                      object_name = datetime.datetime.utcnow().strftime("%Y-%m-%d--%H-%M-%S") + '.txt'
+                      print(bucket_name)
+                      print(object_name)
+                      object = s3.Object(bucket_name, object_name)
+                      object.put(Body=json.dumps(event))
+              except Exception as e:
+                  print("Something went wrong. Eating exception '%s' to prevent retries" % repr(e))
+              return {
+                  "statusCode": 200,
+                  "body": json.dumps({
+                      "message": "Always succeed"
+                  }),
+              }
+
+  ScheduledRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "ScheduledRule"
+      ScheduleExpression: "rate(1 minute)"
+      State: "ENABLED"
+      Targets: 
+        - Arn: !GetAtt EventBridgeTimerHandler.Arn
+          Id: "DataCreationOnSchedule"
+
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref EventBridgeTimerHandler
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ScheduledRule.Arn
+
+  ############################################################################
+  # Lambda handler for S3 event notifications
+  #
+  # Sets up a Lambda function to run every time a file is created in the S3
+  # bucket and delete it. This is a common pattern where the lambda function
+  # would process the file content on upload before deleting or archiving the
+  # file.
+  ############################################################################
+  S3TriggerHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: FISAPI-TARGET-S3TriggerHandlerRole
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: AllowS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - 's3:DeleteObject'
+                Resource: 
+                  - !Sub 'arn:${AWS::Partition}:s3:::${BucketNamePrefix}-${AWS::AccountId}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${BucketNamePrefix}-${AWS::AccountId}/*'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+
+  S3TriggerHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      ReservedConcurrentExecutions: 5
+      Runtime: python3.9
+      Role: !GetAtt S3TriggerHandlerRole.Arn
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          BucketName: !Sub '${BucketNamePrefix}-${AWS::AccountId}'
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import datetime
+          import boto3
+
+          s3 = boto3.resource('s3')
+
+          def lambda_handler(event, context):
+              print(event)
+              try:
+                  for record in event.get("Records",[]):
+                      bucket_name = record.get("s3",{}).get("bucket",{}).get("name",None)
+                      object_name = record.get("s3",{}).get("object",{}).get("key",None)
+                      print(bucket_name)
+                      print(object_name)
+                      object = s3.Object(bucket_name, object_name)
+                      object.delete()
+              except:
+                  print("Something went wrong. Eating exception to prevent retries")
+              return {
+                  "statusCode": 200,
+                  "body": json.dumps({
+                      "message": "Always succeed"
+                  }),
+              }
+
+  PermissionForS3Trigger:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref S3TriggerHandler
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:s3:::${BucketNamePrefix}-${AWS::AccountId}'
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  ############################################################################
+  # Lambda monitor for bucket content
+  #
+  # Create near-real-time observability metrics by listing bucket content.
+  # This is for demo purposes only and will fail above 1000s files in the
+  # S3 bucket.
+  ############################################################################
+  S3CountObjectsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: FISAPI-TARGET-S3CountObjectsRole
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: AllowS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - 's3:ListBucket'
+                Resource: 
+                  - !Sub 'arn:${AWS::Partition}:s3:::${BucketNamePrefix}-${AWS::AccountId}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${BucketNamePrefix}-${AWS::AccountId}/*'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+
+  S3CountObjectsHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      ReservedConcurrentExecutions: 5
+      Runtime: python3.9
+      Role: !GetAtt S3CountObjectsRole.Arn
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          BucketName: !Sub '${BucketNamePrefix}-${AWS::AccountId}'
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import datetime
+          import boto3
+
+          s3 = boto3.client('s3')
+
+          def lambda_handler(event, context):
+              print(event)
+              try:
+                  bucket_name = os.environ.get("BucketName","undefined")
+                  if bucket_name != "undefined":
+                      response = s3.list_objects_v2(Bucket=bucket_name)
+                      num_objects = response.get("Contents",[])            
+                      print(json.dumps({"NumObjects": len(num_objects)}))
+              except Exception as e:
+                  print("Something went wrong. Eating exception '%s' to prevent retries" % repr(e))
+              return {
+                  "statusCode": 200,
+                  "body": json.dumps({
+                      "message": "Always succeed"
+                  }),
+              }
+
+  S3CountObjectsLogGroup:
+    Type: AWS::Logs::LogGroup
+    DependsOn: S3CountObjectsHandler
+    Properties: 
+      LogGroupName: !Sub "/aws/lambda/${S3CountObjectsHandler}"
+      RetentionInDays: 14
+            
+  ScheduledRuleForCountObjects: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "ScheduledRule"
+      ScheduleExpression: "rate(1 minute)"
+      State: "ENABLED"
+      Targets: 
+        - Arn: !GetAtt S3CountObjectsHandler.Arn
+          Id: "ObjectCountOnSchedule"
+
+  PermissionForEventsToCallS3CountObjects:
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref S3CountObjectsHandler
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ScheduledRuleForCountObjects.Arn
+
+  CountObjectsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    DependsOn: S3CountObjectsLogGroup
+    Properties: 
+      FilterName: NumberOfObjects
+      FilterPattern: '{ $.NumObjects >= 0 }'
+      LogGroupName: !Sub "/aws/lambda/${S3CountObjectsHandler}"
+      MetricTransformations: 
+        - MetricName: NumberOfObjects
+          MetricNamespace: FisApiCustom
+          MetricValue: '$.NumObjects'
+          Unit: Count
+
+  ############################################################################
+  # IAM policy preventing S3 object creation
+  #
+  # When this policy is attached to the IAM role for the Lambda function 
+  # creating files in the S3 bucket, the file creation will fail. 
+  ############################################################################
+  AwsFisApiPolicyDenyS3PutObject:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: FISAPI-DenyS3PutObject
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Deny
+            Action: 's3:PutObject'
+            Resource: '*'
+
+  ############################################################################
+  # IAM policy preventing S3 object deletion
+  #
+  # When this policy is attached to the IAM role for the Lambda function 
+  # processing and deleting files from the S3 bucket, the file deletion will 
+  # fail and the files will remain in the S3 bucket as evidence of failure.
+  ############################################################################
+  AwsFisApiPolicyDenyS3DeleteObject:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: FISAPI-DenyS3DeleteObject
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Deny
+            Action: 's3:DeleteObject'
+            Resource: '*'
+
+  ############################################################################
+  # Systems Manager Automation document to attach/detach policies to roles
+  #
+  # This document will attach the provided policy ARN to the provided role 
+  # ARN, wait for the provided duration, then detach the provided policy ARN.
+  #
+  # Note: the ability to modify the IAM role is governed by the permissions of 
+  # the execution role provided. To avoid permission escalations, please ensure
+  # that the execution role is constraining both the target role that can be
+  # modified as well as the policies with which it can be modified.
+  ############################################################################
+  SsmAutomationIamAttachDetachDocument:
+    Type: AWS::SSM::Document
+    DeletionPolicy: Delete
+    Properties:
+      Name: FISAPI-IamAttachDetach
+      DocumentType: Automation
+      Tags:
+        - Key: FISAPI-SecTagTest
+          Value: "true"
+      Content:
+        description: "SSMA Document for Injecting Access Denied Faults on AWS Resources by attaching Deny Policies to the Application's IAM User or Role."
+        schemaVersion: '0.3'
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          TargetResourceDenyPolicyArn:
+            type: String
+            description: ARN of Deny IAM Policy for an AWS Resource that will be Attached to the Application Role.
+          Duration:
+            type: String
+            description: The Duration -in ISO-8601 format- of the Injection (Required).
+          TargetApplicationRoleName:
+            type: String
+            description: 'The name (Friendly Name, not ARN) of the Target Role.'
+          AutomationAssumeRole:
+            type: String
+            description: "The ARN of the SSMA Automation Role that allows the attachment of IAM Policies."
+        mainSteps:
+          - name: AttachDenyPolicy
+            action: 'aws:executeAwsApi'
+            inputs:
+              Service: iam
+              Api: AttachRolePolicy
+              RoleName: '{{TargetApplicationRoleName}}'
+              PolicyArn: '{{TargetResourceDenyPolicyArn}}'
+            description: Attach Deny Policy for Experiment Target
+            timeoutSeconds: 10
+          - name: ExperimentDurationSleep
+            action: 'aws:sleep'
+            inputs:
+              Duration: '{{Duration}}'
+            description: Delay Experiment Injection State as per FIS Experiment Duration Parameter
+            onFailure: 'step:RollbackDetachPolicy'
+            onCancel: 'step:RollbackDetachPolicy'
+            nextStep: RollbackDetachPolicy
+          - name: RollbackDetachPolicy
+            action: 'aws:executeAwsApi'
+            inputs:
+              Service: iam
+              Api: DetachRolePolicy
+              RoleName: '{{TargetApplicationRoleName}}'
+              PolicyArn: '{{TargetResourceDenyPolicyArn}}'
+            description: End Experiment by Detaching Deny Policy from Application Role
+            timeoutSeconds: 10
+            isEnd: true
+
+  ############################################################################
+  # Systems Manager Automation execution role
+  #
+  # This is an example role to use for the SSM attach/detach policy document.
+  # It is designed to be assumed by the ssm.amazonaws.com service principal.
+  #
+  # This role relies on resource tags attached to roles and policies to 
+  # control the roles and policies that can be modified
+  ############################################################################
+  SsmAutomationRole:
+    Type: 'AWS::IAM::Role'
+    DeletionPolicy: Delete
+    Properties:
+      Path: /
+      RoleName: FISAPI-SSM-Automation-Role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+             - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - "ssm.amazonaws.com"
+      Policies:
+      - PolicyName: EnableSsmToAttachDetachPolicies
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Sid: GetRoleAndPolicyDetails
+            Effect: Allow
+            Action:
+              - 'iam:GetRole'
+              - 'iam:GetPolicy'
+              - 'iam:ListAttachedRolePolicies'
+            Resource:
+              # Explicitly listed roles - secure but inflexible
+              - !GetAtt EventBridgeTimerHandlerRole.Arn
+              - !GetAtt S3TriggerHandlerRole.Arn
+              # Explicitly listed policies - secure but inflexible
+              - !Ref AwsFisApiPolicyDenyS3DeleteObject
+          - Sid: AllowOnlyTargetResourcePolicies
+            Effect: Allow
+            Action:  
+              - 'iam:DetachRolePolicy'
+              - 'iam:AttachRolePolicy'
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                'iam:PolicyARN':
+                  # Wildcard policies - secure and flexible
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/${PolicyNamePrefix}*'
+          - Sid: DenyAttachDetachAllRolesExceptApplicationRole
+            Effect: Deny
+            Action: 
+              - 'iam:DetachRolePolicy'
+              - 'iam:AttachRolePolicy'
+            NotResource: 
+              # Wildcard policies - secure and flexible
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${RoleNamePrefixEventBridge}*'
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${RoleNamePrefixS3}*'
+              
+
+  ############################################################################
+  # FIS experiment template demonstrating the use of IAM role modification
+  #
+  # This template will attach a policy preventing S3 object deletion to the
+  # execution role of the Lambda function normally deleting files. During the
+  # experiment duration, files will be created in the S3 bucket but not
+  # deleted.
+  ############################################################################
+  FisDenyS3Template:
+    Type: AWS::FIS::ExperimentTemplate
+    DeletionPolicy: Delete
+    Properties: 
+      Actions:
+        InjectAccessDenied:  
+          ActionId: aws:ssm:start-automation-execution
+          Description: Action to deny S3 access
+          Parameters:
+            documentArn: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/${SsmAutomationIamAttachDetachDocument}'
+            documentParameters: !Sub >-
+              {
+                "TargetResourceDenyPolicyArn":"${AwsFisApiPolicyDenyS3DeleteObject}", 
+                "Duration": "${FaultInjectionExperimentDuration}", 
+                "TargetApplicationRoleName":"${S3TriggerHandlerRole}", 
+                "AutomationAssumeRole":"arn:aws:iam::${AWS::AccountId}:role/${SsmAutomationRole}"
+              }
+            maxDuration: "PT8M"
+      Description: Deny Access to S3 PutObject on a Role.
+      RoleArn: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${FisExperimentRole}'
+      StopConditions:
+        - Source: none
+      Tags: 
+        Name: FISAPI-DENY-S3PutObject
+      Targets:
+        {}
+
+  ############################################################################
+  # FIS experiment execution role
+  #
+  # This is an example role to use for the FIS attach/detach policy 
+  # experiment. It is designed to be assumed by the fis.amazonaws.com service 
+  # principal. It also contains a PassRole statement to provide the SSM
+  # automation role to the SSM execution.
+  #
+  # This role explicitly lists SSM document ARNs that can be invoked.
+  # This role relies on a wildcard match of the Name tag of the SSM document
+  # to control the roles and policies that can be modified
+  ############################################################################
+  FisExperimentRole:
+    Type: 'AWS::IAM::Role'
+    DeletionPolicy: Delete
+    Properties:
+      Path: /
+      RoleName: FISAPI-FIS-Injection-ExperimentRole
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - "fis.amazonaws.com"
+      Policies:
+      - PolicyName: EnableSsmToAttachDetachPolicies
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: RequiredReadActionsforAWSFIS
+              Effect: Allow
+              Action:
+                - 'cloudwatch:DescribeAlarms'
+                - 'ssm:GetAutomationExecution'
+                - 'ssm:ListCommands'
+                - 'iam:ListRoles'
+              Resource: '*'
+            - Sid: RequiredSSMStopActionforAWSFIS
+              Effect: Allow
+              Action:
+                - 'ssm:StopAutomationExecution'
+                - 'ssm:CancelCommand'
+              Resource: '*'
+            - Sid: RequiredSSMWriteActionsforAWSFIS
+              Effect: Allow
+              Action:
+                - 'ssm:StartAutomationExecution'
+              Resource: 
+                # Wildcard resources - secure and flexible
+                # 
+                # Note: the 'automation-definition' is automatically created from 'document' on invocation
+                - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${SsmAutomationDocumentPrefix}*'
+            - Sid: RequiredIAMPassRoleforSSMADocuments
+              Effect: Allow
+              Action: 'iam:PassRole'
+              Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${SsmAutomationRole}'
+
+  ############################################################################
+  # Assumanle roles
+  #
+  # This template contains two assumable roles. The first role permits the 
+  # creation and modification of FIS templates as well as running FIS 
+  # experiments. The second role only allows running experiments.
+  #
+  # Both roles require the presence of Name tags with values that start with
+  # FISAPI- (by default). In particular this means that all experiment 
+  # execution has to add a Name tag starting with FISAPI-  
+  ############################################################################
+  FisUserRoleWithCreationPrivileges:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: FISAPI-AssumableRoleWithCreation
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: 
+                # Should constrain this further but for blog post don't know user or role ARN
+                - !Sub "${AWS::AccountId}"
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      # # For a console user we would probably enable at least ReadOnlyAccess
+      # ManagedPolicyArns:
+      #   - 'arn:aws:iam::aws:policy/ReadOnlyAccess'
+      Policies:
+        - PolicyName: ReadOnlyAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowListActionsForAll
+                Effect: Allow
+                Action: 
+                  - 'fis:List*'
+                Resource: 
+                  - '*'
+              - Sid: LimitByExperimentName
+                Effect: Allow
+                Action: 
+                  - 'fis:Get*'
+                Resource: 
+                  - 'arn:aws:fis:*:*:experiment/*'
+                Condition:
+                  StringLike:
+                    aws:ResourceTag/Name: "FISAPI-*"
+              - Sid: LimitByTemplateName
+                Effect: Allow
+                Action: 
+                  - 'fis:Get*'
+                Resource: 
+                  - 'arn:aws:fis:*:*:experiment-template/*'
+                Condition:
+                  StringLike:
+                    aws:ResourceTag/Name: "FISAPI-*"
+        - PolicyName: ExecutionAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: PassRolePermission
+                Effect: Allow
+                Action: 'iam:PassRole'
+                Resource: !GetAtt FisExperimentRole.Arn
+              - Sid: LimitByExperimentName
+                Effect: Allow
+                Action: 
+                  - 'fis:Inject*'
+                  - 'fis:StartExperiment'
+                  - 'fis:StopExperiment'
+                Resource: 
+                  - 'arn:aws:fis:*:*:experiment/*'
+                Condition:
+                  StringLike:
+                    aws:ResourceTag/Name: "FISAPI-*"
+              - Sid: LimitByTemplateName
+                Effect: Allow
+                Action: 
+                  - 'fis:Inject*'
+                  - 'fis:StartExperiment'
+                  - 'fis:StopExperiment'
+                Resource: 
+                  - 'arn:aws:fis:*:*:experiment-template/*'
+                Condition:
+                  StringLike:
+                    aws:ResourceTag/Name: "FISAPI-*"
+              - Sid: AllowExperimentTagging
+                Effect: Allow
+                Action: 
+                  - 'fis:TagResource'
+                Resource: 
+                  - 'arn:aws:fis:*:*:experiment/*'
+                Condition:
+                  StringLike:
+                    aws:ResourceTag/Name: "FISAPI-*"
+        - PolicyName: TemplateCreationAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: LimitByTemplate
+                Effect: Allow
+                Action: 
+                  - 'fis:CreateExperimentTemplate'
+                  - 'fis:DeleteExperimentTemplate'
+                  - 'fis:UpdateExperimentTemplate'
+                  - 'fis:TagResource'
+                  - 'fis:UntagResource'
+                Resource: 
+                  - 'arn:aws:fis:*:*:experiment-template/*'
+                Condition:
+                  StringLike:
+                    aws:ResourceTag/Name: "FISAPI-*"
+              - Sid: ActionChangesProtectedByTemplateUpdate
+                Effect: Allow
+                Action: 
+                  - 'fis:CreateExperimentTemplate'
+                  - 'fis:DeleteExperimentTemplate'
+                  - 'fis:UpdateExperimentTemplate'
+                  - 'fis:TagResource'
+                  - 'fis:UntagResource'
+                Resource: 
+                  - 'arn:aws:fis:*:*:action/*'
+
+
+  FisUserRoleWithoutCreationPrivileges:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: FISAPI-AssumableRoleWithoutCreation
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: 
+                # Should constrain this further but for blog post don't know user or role ARN
+                - !Sub "${AWS::AccountId}"
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      # # For a console user we would probably enable at least ReadOnlyAccess
+      # ManagedPolicyArns:
+      #   - 'arn:aws:iam::aws:policy/ReadOnlyAccess'
+      Policies:
+        - PolicyName: ReadOnlyAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowListActionsForAll
+                Effect: Allow
+                Action: 
+                  - 'fis:List*'
+                Resource: 
+                  - '*'
+              - Sid: LimitByExperimentName
+                Effect: Allow
+                Action: 
+                  - 'fis:Get*'
+                Resource: 
+                  - 'arn:aws:fis:*:*:experiment/*'
+                Condition:
+                  StringLike:
+                    aws:ResourceTag/Name: "FISAPI-*"
+              - Sid: LimitByTemplateName
+                Effect: Allow
+                Action: 
+                  - 'fis:Get*'
+                Resource: 
+                  - 'arn:aws:fis:*:*:experiment-template/*'
+                Condition:
+                  StringLike:
+                    aws:ResourceTag/Name: "FISAPI-*"
+        - PolicyName: ExecutionAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: PassRolePermission
+                Effect: Allow
+                Action: 'iam:PassRole'
+                Resource: !GetAtt FisExperimentRole.Arn
+              - Sid: LimitByExperimentName
+                Effect: Allow
+                Action: 
+                  - 'fis:Inject*'
+                  - 'fis:StartExperiment'
+                  - 'fis:StopExperiment'
+                Resource: 
+                  - 'arn:aws:fis:*:*:experiment/*'
+                Condition:
+                  StringLike:
+                    aws:ResourceTag/Name: "FISAPI-*"
+              - Sid: LimitByTemplateName
+                Effect: Allow
+                Action: 
+                  - 'fis:Inject*'
+                  - 'fis:StartExperiment'
+                  - 'fis:StopExperiment'
+                Resource: 
+                  - 'arn:aws:fis:*:*:experiment-template/*'
+                Condition:
+                  StringLike:
+                    aws:ResourceTag/Name: "FISAPI-*"
+              - Sid: AllowExperimentTagging
+                Effect: Allow
+                Action: 
+                  - 'fis:TagResource'
+                Resource: 
+                  - 'arn:aws:fis:*:*:experiment/*'
+                Condition:
+                  StringLike:
+                    aws:ResourceTag/Name: "FISAPI-*"
+
+
+Outputs:
+  FisapiTargetS3TriggerHandlerRoleArn:
+    Description: FISAPI-TARGET-S3TriggerHandlerRole - IAM role granting permissions to Lambda function for handling S3 triggers
+    Value: !Ref S3TriggerHandlerRole
+  FisapiSsmAutomationRoleArn:
+    Description: FISAPI-SSM-Automation-Role - IAM role granting SSM permission to modify IAM roles
+    Value: !GetAtt SsmAutomationRole.Arn
+  FisApiIamAttachDetachDocumentName:
+    Description: Name of SSM document to modify IAM roles
+    Value: !Ref SsmAutomationIamAttachDetachDocument
+  FisApiIamAttachDetachDocumenArn:
+    Description: Arn of SSM document to modify IAM roles
+    Value: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${SsmAutomationIamAttachDetachDocument}"
+  FisS3BucketName:
+    Description: Bucket name created for file creation and deletion demo
+    Value: !Ref S3Bucket
+  FisDenyS3TemplateId:
+    Description: ID of S3 Deny Access FIS template
+    Value: !Ref FisDenyS3Template
+  FisEventBridgeTimerHandlerRoleArn:
+    Description: FISAPI-TARGET-EventBridgeTimerHandlerRole - IAM role granting permissions to Lambda function for handling EventBridge events
+    Value: !GetAtt EventBridgeTimerHandlerRole.Arn

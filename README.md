@@ -1,17 +1,28 @@
-## My Project
+# Validate resilience at API boundaries with AWS Fault Injection Simulator and IAM policies
 
-TODO: Fill this README out!
+This repo contains AWS CloudFormation templates supporting a blog post (link TBD) about extending AWS Fault Injection Service fault injections by modifying IAM policies. 
 
-Be sure to:
+This code is released under [MIT-0 license](LICENSE.md). 
 
-* Change the title in this README
-* Edit your repository description on GitHub
+Please see the blog post for how to use these templates.
 
-## Security
+## Deployment
 
-See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+Deploy the templates with 
 
-## License
+```bash
+aws cloudformation deploy \
+  --stack-name test-fis-api-faults \
+  --template-file template.yaml \
+  --capabilities CAPABILITY_NAMED_IAM
+```
 
-This library is licensed under the MIT-0 License. See the LICENSE file.
+and
+
+```bash
+aws cloudformation deploy \
+  --stack-name test-fis-api-faults \
+  --template-file template2.yaml 
+  --capabilities CAPABILITY_NAMED_IAM
+```
 
